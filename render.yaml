@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: bhoomitra-geopdf-server
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
