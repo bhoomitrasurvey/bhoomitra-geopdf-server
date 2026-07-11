@@ -492,6 +492,158 @@ def get_metadata():
 
 
 # ============================================================
+# NEW: RECTIFY / CONVERT GEOTIFF
+# ------------------------------------------------------------
+# Separate from /convert (GeoPDF). Used as a FALLBACK when the
+# app's on-device pure-JS reader can't find simple grid
+# georeferencing (ModelTransformation, or ModelPixelScale +
+# ModelTiepoint) in a GeoTIFF — most commonly because the file
+# uses Ground Control Points (GCPs) or RPC coefficients instead.
+#
+# gdal.Warp (unlike gdal.Translate, used in /convert) actually
+# resolves GCPs/RPCs into a genuine rectified grid, producing an
+# output file with a normal, simple affine transform the app CAN
+# read on-device from then on (we cache the rectified result).
+#
+# This route is intentionally independent of has_georef() /
+# extract_metadata() usage patterns in /convert, so nothing here
+# can change GeoPDF behavior.
+# ============================================================
+@app.route('/convert-tiff', methods=['POST'])
+def convert_tiff():
+    input_path = None
+    output_path = None
+
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'NO FILE PROVIDED'}), 400
+
+        file = request.files['file']
+
+        if not file.filename:
+            return jsonify({'error': 'NO FILE SELECTED'}), 400
+
+        filename = file.filename.lower()
+        if not (filename.endswith('.tif') or filename.endswith('.tiff')):
+            return jsonify({'error': 'ONLY GEOTIFF FILES ARE ACCEPTED'}), 400
+
+        file.seek(0, 2)
+        file_size = file.tell()
+        file.seek(0)
+
+        if file_size > MAX_FILE_SIZE:
+            return jsonify({
+                'error': f'FILE SIZE {file_size/(1024*1024):.1f} MB EXCEEDS 99 MB LIMIT'
+            }), 400
+
+        if file_size == 0:
+            return jsonify({'error': 'FILE IS EMPTY'}), 400
+
+        logger.info(f'Rectifying GeoTIFF: {file.filename} ({file_size/(1024*1024):.1f} MB)')
+
+        temp_id = str(uuid.uuid4())
+        temp_dir = tempfile.gettempdir()
+        input_path = os.path.join(temp_dir, f'{temp_id}_input.tif')
+        output_path = os.path.join(temp_dir, f'{temp_id}_rectified.tif')
+
+        file.save(input_path)
+
+        dataset = gdal.Open(input_path, gdal.GA_ReadOnly)
+        if dataset is None:
+            cleanup(input_path)
+            return jsonify({'error': 'COULD NOT OPEN FILE. FILE MAY BE CORRUPTED OR NOT A VALID GEOTIFF.'}), 400
+
+        # A file is rectifiable here if it has EITHER a normal
+        # geotransform OR ground control points. (Plain has_georef()
+        # alone would reject GCP-only files, which are exactly the
+        # ones this route exists to handle.)
+        gcp_count = dataset.GetGCPCount()
+        has_affine = has_georef(dataset)
+
+        if not has_affine and gcp_count == 0:
+            dataset = None
+            cleanup(input_path)
+            return jsonify({
+                'error': 'FILE HAS NO GEOGRAPHIC REFERENCE AT ALL (NO GEOTRANSFORM AND NO GROUND CONTROL POINTS). CANNOT RECTIFY.'
+            }), 400
+
+        warp_kwargs = dict(
+            format='GTiff',
+            dstSRS='EPSG:4326',
+            resampleAlg='bilinear',
+            creationOptions=[
+                'COMPRESS=LZW', 'TILED=YES',
+                'BLOCKXSIZE=256', 'BLOCKYSIZE=256',
+                'BIGTIFF=IF_NEEDED',
+            ],
+        )
+        # GCP-only files (no usable geotransform) need a
+        # thin-plate-spline warp driven by the GCPs themselves.
+        if gcp_count > 0 and not has_affine:
+            warp_kwargs['tps'] = True
+
+        warp_options = gdal.WarpOptions(**warp_kwargs)
+
+        try:
+            warped = gdal.Warp(output_path, dataset, options=warp_options)
+        except Exception as warp_error:
+            dataset = None
+            cleanup(input_path, output_path)
+            return jsonify({
+                'error': f'RECTIFICATION FAILED: {str(warp_error)}. FILE MAY USE AN UNSUPPORTED GEOREFERENCING METHOD.'
+            }), 500
+
+        dataset = None
+
+        if warped is None or not os.path.exists(output_path):
+            cleanup(input_path, output_path)
+            return jsonify({'error': 'RECTIFICATION FAILED. FILE MAY USE AN UNSUPPORTED GEOREFERENCING METHOD.'}), 500
+
+        warped.BuildOverviews('AVERAGE', [2, 4, 8, 16, 32])
+        metadata = extract_metadata(warped)
+        warped = None
+
+        cleanup(input_path)
+
+        if not metadata:
+            cleanup(output_path)
+            return jsonify({'error': 'COULD NOT EXTRACT METADATA AFTER RECTIFICATION.'}), 500
+
+        logger.info(f'Rectified: {os.path.getsize(output_path)/(1024*1024):.1f} MB')
+        logger.info(f'Bounds: {metadata["minLon"]},{metadata["minLat"]} to {metadata["maxLon"]},{metadata["maxLat"]}')
+
+        response = send_file(
+            output_path,
+            mimetype='image/tiff',
+            as_attachment=True,
+            download_name=f'rectified_{temp_id}.tif',
+            max_age=0,
+        )
+
+        response.headers['X-Min-Lon'] = str(metadata['minLon'])
+        response.headers['X-Max-Lon'] = str(metadata['maxLon'])
+        response.headers['X-Min-Lat'] = str(metadata['minLat'])
+        response.headers['X-Max-Lat'] = str(metadata['maxLat'])
+        response.headers['X-Projection'] = metadata['projection']
+        response.headers['X-Datum'] = metadata['datum']
+        response.headers['X-Image-Width'] = str(metadata['imageWidth'])
+        response.headers['X-Image-Height'] = str(metadata['imageHeight'])
+        response.headers['X-Bands'] = str(metadata['bands'])
+        response.headers['Access-Control-Expose-Headers'] = (
+            'X-Min-Lon, X-Max-Lon, X-Min-Lat, X-Max-Lat, '
+            'X-Projection, X-Datum, X-Image-Width, '
+            'X-Image-Height, X-Bands'
+        )
+
+        return response
+
+    except Exception as e:
+        logger.error(f'GeoTIFF rectification error: {str(e)}')
+        cleanup(input_path, output_path)
+        return jsonify({'error': f'SERVER ERROR: {str(e)}'}), 500
+
+
+# ============================================================
 # RUN
 # ============================================================
 if __name__ == '__main__':
